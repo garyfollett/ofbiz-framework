@@ -110,6 +110,8 @@ dependencies {
     runtimeOnly libs.log4j.web //???
     runtimeOnly libs.log4j.jcl // need to constrain to version to avoid classpath conflict (ReflectionUtil)
 
+    runtimeOnly 'org.postgresql:postgresql:42.7.13'
+
     codenarc(libs.codenarc)
 
     // use constraints to update transitive dependencies
