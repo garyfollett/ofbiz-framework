@@ -27,6 +27,7 @@ under the License.
     <load-component component-location="minilang"/>
     <load-component component-location="common"/>
     <load-component component-location="service"/>
+    <load-component component-location="agent"/>
     <load-component component-location="catalina"/>
     <load-component component-location="entityext"/>
     <load-component component-location="webapp"/>
