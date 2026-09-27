@@ -40,3 +40,6 @@ desktop.ini
 *.patch
 node_modules/
 /docs/asciidoc/images/
+
+/framework/entity/config/entityengine copy.xml
+/ofbiz-framework.code-workspace
