@@ -23,6 +23,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import javax.transaction.Status;
+import javax.transaction.Transaction;
+
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.entity.GenericEntityException;
@@ -46,16 +49,39 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 /**
  * OFBiz Service Engine for governed AI agent execution.
  *
- * <p>The engine deliberately separates agent reasoning from business-data
- * access. Agent metadata is read through the Entity Engine, while business
- * operations are performed only by declared OFBiz services invoked through
- * {@link LocalDispatcher}.</p>
+ * <p>The agent engine is the deterministic execution coordinator for one
+ * invocation of an OFBiz agent service. OFBiz remains authoritative for
+ * identity, authorization, service validation, transaction semantics,
+ * business data, business operations, ECAs and service callbacks.</p>
+ *
+ * <p>The model is deliberately treated as an untrusted reasoning component.
+ * It can request only tools declared for the registered agent. Authoritative
+ * execution scope, including {@code partyId} and {@code userLogin}, is supplied
+ * by OFBiz and cannot be widened or replaced by model output.</p>
+ *
+ * <p>External LLM/network communication is prohibited while an OFBiz
+ * transaction is associated with the current execution thread. If the caller
+ * entered the agent service with an existing transaction, this engine suspends
+ * the transaction for the complete agent orchestration and restores it before
+ * returning to the Service Dispatcher.</p>
+ *
+ * <p>Business operations are performed only through {@link LocalDispatcher}.
+ * The agent engine does not query or mutate OFBiz business entities directly.
+ * Entity Engine access performed here is restricted to agent infrastructure
+ * metadata.</p>
+ *
+ * <p>{@link AgentTrace} observes execution boundaries, payloads, timing and
+ * transaction state. Tracing is non-authoritative: execution invariants remain
+ * enforced by this engine independently of trace output.</p>
  */
 public final class AgentServiceEngine extends GenericAsyncEngine {
 
     private static final String MODULE = AgentServiceEngine.class.getName();
+
     private static final String PROPERTY_RESOURCE = "agent";
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    private static final ObjectMapper OBJECT_MAPPER =
+            new ObjectMapper();
 
     private static final int MAX_COMPLETION_TOKENS = 512;
 
@@ -64,7 +90,9 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
      *
      * @param dispatcher OFBiz service dispatcher
      */
-    public AgentServiceEngine(ServiceDispatcher dispatcher) {
+    public AgentServiceEngine(
+            ServiceDispatcher dispatcher) {
+
         super(dispatcher);
     }
 
@@ -72,191 +100,984 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
     public void runSyncIgnore(
             String localName,
             ModelService modelService,
-            Map<String, Object> context) throws GenericServiceException {
+            Map<String, Object> context)
+            throws GenericServiceException {
 
-        runSync(localName, modelService, context);
+        runSync(
+                localName,
+                modelService,
+                context);
     }
 
+    /**
+     * Executes one governed agent invocation.
+     *
+     * <p>The lifecycle is deliberately bounded:</p>
+     *
+     * <pre>
+     * validate
+     *   -> establish trace
+     *   -> suspend inherited transaction
+     *   -> load agent metadata
+     *   -> first LLM call
+     *   -> validate one tool call
+     *   -> invoke one governed OFBiz service
+     *   -> second LLM call
+     *   -> validate final response
+     *   -> restore inherited transaction
+     *   -> return
+     * </pre>
+     *
+     * <p>V1 intentionally does not implement autonomous tool loops,
+     * multi-agent delegation, memory, retries, human approval or policy
+     * evaluation.</p>
+     */
     @Override
     public Map<String, Object> runSync(
             String localName,
             ModelService modelService,
-            Map<String, Object> context) throws GenericServiceException {
+            Map<String, Object> context)
+            throws GenericServiceException {
 
-        rejectActiveTransaction();
-
+        /*
+         * Perform the minimum validation necessary before creating the trace.
+         *
+         * We need a valid service and agent identity before agent-scoped
+         * correlation fields can be installed.
+         */
         if (modelService == null) {
-            throw new GenericServiceException("Agent service model must not be null");
+            throw new GenericServiceException(
+                    "Agent service model must not be null");
         }
 
         if (context == null) {
-            throw new GenericServiceException("Agent service context must not be null");
+            throw new GenericServiceException(
+                    "Agent service context must not be null");
         }
 
-        DispatchContext dctx = getDispatcher().getLocalContext(localName);
+        DispatchContext dctx =
+                getDispatcher().getLocalContext(
+                        localName);
 
         if (dctx == null) {
             throw new GenericServiceException(
                     "Unable to obtain DispatchContext for agent service");
         }
 
-        String agentId = modelService.getInvoke();
+        String agentId =
+                modelService.getInvoke();
 
-        if (agentId == null || agentId.isBlank()) {
+        if (agentId == null
+                || agentId.isBlank()) {
+
             throw new GenericServiceException(
-                    "Agent service [" + modelService.getName()
+                    "Agent service ["
+                    + modelService.getName()
                     + "] does not define an agent identifier in invoke");
         }
 
-        String partyId = (String) context.get("partyId");
+        String partyId =
+                (String) context.get(
+                        "partyId");
 
-        if (partyId == null || partyId.isBlank()) {
+        if (partyId == null
+                || partyId.isBlank()) {
+
             throw new GenericServiceException(
                     "Agent service requires a non-empty partyId");
         }
 
-        Object userLogin = context.get("userLogin");
+        Object userLogin =
+                context.get(
+                        "userLogin");
 
         if (userLogin == null) {
             throw new GenericServiceException(
                     "Agent service requires the authenticated userLogin");
         }
 
+        AgentTrace trace =
+                AgentTrace.start(
+                        modelService.getName(),
+                        agentId);
+
+        /*
+         * Any transaction inherited from the caller is stored here after it
+         * has been suspended. It is restored in the outer finally block.
+         */
+        Transaction parentTransaction = null;
+
+        /*
+         * Preserve the execution failure so that:
+         *
+         * 1. transaction restoration is attempted before terminal tracing;
+         * 2. a restoration failure can become the terminal failure; and
+         * 3. the original execution failure can be retained as a suppressed
+         *    exception if restoration itself fails.
+         */
+        Throwable executionFailure = null;
+
+        /*
+         * AGENT_SUCCESS must mean that both the agent execution and parent
+         * transaction restoration completed successfully.
+         */
+        boolean executionCompleted = false;
+
         try {
-            GenericValue agentDefinition = loadAgentDefinition(dctx, agentId);
-            List<GenericValue> agentTools = loadAgentTools(dctx, agentId);
+            /*
+             * =============================================================
+             * TRANSACTION ISOLATION
+             * =============================================================
+             */
+
+            parentTransaction =
+                    suspendParentTransaction(
+                            trace);
+
+            assertNoActiveTransaction(
+                    trace,
+                    "before agent metadata load");
+
+            /*
+             * =============================================================
+             * AGENT METADATA
+             * =============================================================
+             */
+
+            long metadataStart =
+                    trace.mark();
+
+            trace.diagnostic(
+                    AgentTrace.METADATA_LOAD_START);
+
+            GenericValue agentDefinition =
+                    loadAgentDefinition(
+                            dctx,
+                            agentId);
+
+            List<GenericValue> agentTools =
+                    loadAgentTools(
+                            dctx,
+                            agentId);
+
+            trace.diagnostic(
+                    AgentTrace.METADATA_LOAD_END,
+                    "durationMs",
+                    AgentTrace.elapsedMillis(
+                            metadataStart),
+                    "toolCount",
+                    agentTools.size());
 
             if (agentTools.size() != 1) {
                 throw new GenericServiceException(
-                        "Agent [" + agentId
+                        "Agent ["
+                        + agentId
                         + "] must have exactly one declared tool in V1");
             }
 
-            String systemPrompt = agentDefinition.getString("systemPrompt");
-            String toolServiceName = agentTools.get(0).getString("serviceName");
+            String systemPrompt =
+                    agentDefinition.getString(
+                            "systemPrompt");
 
-            if (systemPrompt == null || systemPrompt.isBlank()) {
+            String toolServiceName =
+                    agentTools.get(0).getString(
+                            "serviceName");
+
+            if (systemPrompt == null
+                    || systemPrompt.isBlank()) {
+
                 throw new GenericServiceException(
-                        "Agent [" + agentId + "] has no system prompt");
+                        "Agent ["
+                        + agentId
+                        + "] has no system prompt");
             }
 
-            if (toolServiceName == null || toolServiceName.isBlank()) {
+            if (toolServiceName == null
+                    || toolServiceName.isBlank()) {
+
                 throw new GenericServiceException(
-                        "Agent [" + agentId + "] has an invalid tool definition");
+                        "Agent ["
+                        + agentId
+                        + "] has an invalid tool definition");
             }
 
-            String baseUrl = UtilProperties.getPropertyValue(
-                    PROPERTY_RESOURCE,
-                    "agent.llm.baseUrl");
+            /*
+             * =============================================================
+             * MODEL CONFIGURATION
+             * =============================================================
+             */
 
-            String model = UtilProperties.getPropertyValue(
-                    PROPERTY_RESOURCE,
-                    "agent.llm.model");
+            String baseUrl =
+                    UtilProperties.getPropertyValue(
+                            PROPERTY_RESOURCE,
+                            "agent.llm.baseUrl");
 
-            long connectTimeoutMillis = UtilProperties.getPropertyAsLong(
-                    PROPERTY_RESOURCE,
-                    "agent.llm.connectTimeoutMillis",
-                    5000L);
+            String model =
+                    UtilProperties.getPropertyValue(
+                            PROPERTY_RESOURCE,
+                            "agent.llm.model");
 
-            long requestTimeoutMillis = UtilProperties.getPropertyAsLong(
-                    PROPERTY_RESOURCE,
-                    "agent.llm.requestTimeoutMillis",
-                    120000L);
+            long connectTimeoutMillis =
+                    UtilProperties.getPropertyAsLong(
+                            PROPERTY_RESOURCE,
+                            "agent.llm.connectTimeoutMillis",
+                            5000L);
 
-            if (baseUrl == null || baseUrl.isBlank()) {
+            long requestTimeoutMillis =
+                    UtilProperties.getPropertyAsLong(
+                            PROPERTY_RESOURCE,
+                            "agent.llm.requestTimeoutMillis",
+                            120000L);
+
+            if (baseUrl == null
+                    || baseUrl.isBlank()) {
+
                 throw new GenericServiceException(
                         "agent.llm.baseUrl is not configured");
             }
 
-            if (model == null || model.isBlank()) {
+            if (model == null
+                    || model.isBlank()) {
+
                 throw new GenericServiceException(
                         "agent.llm.model is not configured");
             }
 
-            OpenAiCompatibleClient client = new OpenAiCompatibleClient(
-                    baseUrl,
-                    connectTimeoutMillis,
-                    requestTimeoutMillis);
+            OpenAiCompatibleClient client =
+                    new OpenAiCompatibleClient(
+                            baseUrl,
+                            connectTimeoutMillis,
+                            requestTimeoutMillis);
 
-            ObjectNode firstRequest = buildInitialRequest(
-                    model,
-                    systemPrompt,
-                    toolServiceName);
+            /*
+             * =============================================================
+             * FIRST MODEL INTERACTION
+             * =============================================================
+             *
+             * The first request exposes exactly one conceptual OFBiz tool.
+             * The model is forced to call the tool and cannot supply partyId.
+             */
+
+            ObjectNode firstRequest =
+                    buildInitialRequest(
+                            model,
+                            systemPrompt,
+                            toolServiceName);
 
             JsonNode firstResponse =
-                    client.createChatCompletion(firstRequest);
+                    callLlm(
+                            trace,
+                            client,
+                            1,
+                            model,
+                            firstRequest);
 
-            ToolCall toolCall = extractRequiredToolCall(
-                    firstResponse,
-                    toolServiceName);
+            /*
+             * =============================================================
+             * TOOL-CALL VALIDATION
+             * =============================================================
+             */
 
+            ToolCall toolCall =
+                    extractRequiredToolCall(
+                            firstResponse,
+                            toolServiceName);
+
+            trace.operational(
+                    AgentTrace.TOOL_SELECTED,
+                    "service",
+                    toolCall.functionName(),
+                    "toolCallId",
+                    toolCall.id());
+
+            /*
+             * The model has no authority over the actual business-service
+             * scope. partyId and userLogin come from the original OFBiz call.
+             */
             Map<String, Object> toolContext =
-                    buildToolContext(context, partyId, userLogin);
+                    buildToolContext(
+                            context,
+                            partyId,
+                            userLogin);
 
-            LocalDispatcher localDispatcher = dctx.getDispatcher();
+            LocalDispatcher localDispatcher =
+                    dctx.getDispatcher();
 
-            Map<String, Object> toolResult =
-                    localDispatcher.runSync(
-                            toolServiceName,
-                            toolContext);
+            /*
+             * =============================================================
+             * GOVERNED OFBIZ TOOL EXECUTION
+             * =============================================================
+             */
 
-            if (ServiceUtil.isError(toolResult)
-                    || ServiceUtil.isFailure(toolResult)) {
-                throw new GenericServiceException(
-                        "Agent tool [" + toolServiceName + "] failed: "
-                        + ServiceUtil.getErrorMessage(toolResult));
+            assertNoActiveTransaction(
+                    trace,
+                    "before governed tool invocation");
+
+            long toolStart =
+                    trace.mark();
+
+            trace.operational(
+                    AgentTrace.TOOL_CALL_START,
+                    "service",
+                    toolServiceName,
+                    "toolCallId",
+                    toolCall.id());
+
+            final Map<String, Object> toolResult;
+
+            try {
+                toolResult =
+                        localDispatcher.runSync(
+                                toolServiceName,
+                                toolContext);
+
+            } catch (GenericServiceException e) {
+
+                trace.operational(
+                        AgentTrace.TOOL_CALL_FAILURE,
+                        "service",
+                        toolServiceName,
+                        "toolCallId",
+                        toolCall.id(),
+                        "durationMs",
+                        AgentTrace.elapsedMillis(
+                                toolStart),
+                        "failureType",
+                        e.getClass().getName(),
+                        "failureMessage",
+                        e.getMessage());
+
+                throw e;
             }
 
-            String toolResultJson = buildToolResultJson(toolResult);
+            /*
+             * A normal OFBiz tool service owns and completes its own
+             * transaction. When control returns to the agent runtime there
+             * must once again be no transaction on the current thread.
+             */
+            assertNoActiveTransaction(
+                    trace,
+                    "after governed tool invocation");
 
-            ObjectNode finalRequest = buildFinalRequest(
-                    model,
-                    systemPrompt,
-                    toolCall,
-                    toolResultJson);
+            String toolResponseMessage =
+                    toolResult.get("responseMessage") == null
+                            ? "<none>"
+                            : toolResult.get("responseMessage").toString();
+
+            trace.operational(
+                    AgentTrace.TOOL_CALL_RESULT,
+                    "service",
+                    toolServiceName,
+                    "toolCallId",
+                    toolCall.id(),
+                    "durationMs",
+                    AgentTrace.elapsedMillis(
+                            toolStart),
+                    "responseMessage",
+                    toolResponseMessage);
+
+            /*
+             * This is the complete service result returned to the agent
+             * runtime by LocalDispatcher.
+             *
+             * With payload tracing set to FULL this boundary lets us
+             * distinguish:
+             *
+             * OFBiz tool output
+             *
+             * from
+             *
+             * data later supplied to the model.
+             */
+            trace.payload(
+                    AgentTrace.TOOL_RESULT_RAW,
+                    toolResult,
+                    "service",
+                    toolServiceName,
+                    "toolCallId",
+                    toolCall.id());
+
+            if (ServiceUtil.isError(
+                    toolResult)
+                    || ServiceUtil.isFailure(
+                            toolResult)) {
+
+                trace.operational(
+                        AgentTrace.TOOL_CALL_FAILURE,
+                        "service",
+                        toolServiceName,
+                        "toolCallId",
+                        toolCall.id(),
+                        "responseMessage",
+                        toolResponseMessage,
+                        "errorMessage",
+                        ServiceUtil.getErrorMessage(
+                                toolResult));
+
+                throw new GenericServiceException(
+                        "Agent tool ["
+                        + toolServiceName
+                        + "] failed: "
+                        + ServiceUtil.getErrorMessage(
+                                toolResult));
+            }
+
+            /*
+             * Serialize only the explicitly permitted business outputs.
+             *
+             * This representation is the exact business data that will be
+             * exposed to the model.
+             */
+            String toolResultJson =
+                    buildToolResultJson(
+                            toolResult);
+
+            trace.payload(
+                    AgentTrace.TOOL_RESULT_FOR_MODEL,
+                    toolResultJson,
+                    "service",
+                    toolServiceName,
+                    "toolCallId",
+                    toolCall.id());
+
+            /*
+             * =============================================================
+             * SECOND MODEL INTERACTION
+             * =============================================================
+             *
+             * No tools are exposed in this request. V1 therefore cannot enter
+             * an autonomous tool loop.
+             */
+
+            ObjectNode finalRequest =
+                    buildFinalRequest(
+                            model,
+                            systemPrompt,
+                            toolCall,
+                            toolResultJson);
 
             JsonNode finalResponse =
-                    client.createChatCompletion(finalRequest);
+                    callLlm(
+                            trace,
+                            client,
+                            2,
+                            model,
+                            finalRequest);
 
-            String summary = extractFinalSummary(finalResponse);
+            /*
+             * =============================================================
+             * FINAL OUTPUT VALIDATION
+             * =============================================================
+             */
 
-            Map<String, Object> result = ServiceUtil.returnSuccess();
-            result.put("summary", summary);
+            String summary =
+                    extractFinalSummary(
+                            finalResponse);
+
+            trace.payload(
+                    AgentTrace.FINAL_SUMMARY,
+                    summary);
+
+            trace.operational(
+                    AgentTrace.OUTPUT_VALIDATED,
+                    "output",
+                    "summary");
+
+            Map<String, Object> result =
+                    ServiceUtil.returnSuccess();
+
+            result.put(
+                    "summary",
+                    summary);
+
+            /*
+             * Do not emit AGENT_SUCCESS here.
+             *
+             * The inherited transaction still has to be restored. A failure
+             * to restore it means the overall agent invocation did not
+             * complete successfully.
+             */
+            executionCompleted = true;
 
             return result;
 
         } catch (GenericServiceException e) {
+
+            executionFailure = e;
+
             throw e;
+
         } catch (GenericEntityException e) {
-            Debug.logError(e, "Unable to load agent metadata", MODULE);
-            throw new GenericServiceException(
-                    "Unable to load agent metadata", e);
+
+            Debug.logError(
+                    e,
+                    "Unable to load agent metadata",
+                    MODULE);
+
+            GenericServiceException wrapped =
+                    new GenericServiceException(
+                            "Unable to load agent metadata",
+                            e);
+
+            executionFailure = wrapped;
+
+            throw wrapped;
+
         } catch (IOException e) {
-            Debug.logError(e, "Agent LLM request failed", MODULE);
-            throw new GenericServiceException(
-                    "Agent LLM request failed", e);
+
+            Debug.logError(
+                    e,
+                    "Agent LLM request failed",
+                    MODULE);
+
+            GenericServiceException wrapped =
+                    new GenericServiceException(
+                            "Agent LLM request failed",
+                            e);
+
+            executionFailure = wrapped;
+
+            throw wrapped;
+
         } catch (RuntimeException e) {
-            Debug.logError(e, "Unexpected agent execution failure", MODULE);
-            throw new GenericServiceException(
-                    "Unexpected agent execution failure", e);
+
+            Debug.logError(
+                    e,
+                    "Unexpected agent execution failure",
+                    MODULE);
+
+            GenericServiceException wrapped =
+                    new GenericServiceException(
+                            "Unexpected agent execution failure",
+                            e);
+
+            executionFailure = wrapped;
+
+            throw wrapped;
+
+        } catch (Error e) {
+
+            /*
+             * Even fatal JVM-level errors must pass through the finally block
+             * so a suspended caller transaction is not silently abandoned.
+             */
+            executionFailure = e;
+
+            Debug.logError(
+                    e,
+                    "Unexpected agent execution error",
+                    MODULE);
+
+            throw e;
+
+        } finally {
+
+            /*
+             * =============================================================
+             * PARENT TRANSACTION RESTORATION
+             * =============================================================
+             *
+             * This happens before terminal trace status is recorded.
+             */
+
+            GenericServiceException restorationFailure =
+                    null;
+
+            try {
+                resumeParentTransaction(
+                        parentTransaction,
+                        trace);
+
+            } catch (GenericServiceException e) {
+
+                restorationFailure = e;
+
+                /*
+                 * If execution had already failed, preserve that failure as
+                 * evidence while treating transaction restoration failure as
+                 * the terminal failure.
+                 */
+                if (executionFailure != null) {
+                    e.addSuppressed(
+                            executionFailure);
+                }
+            }
+
+            /*
+             * =============================================================
+             * TERMINAL TRACE STATUS
+             * =============================================================
+             */
+
+            if (restorationFailure != null) {
+
+                trace.failure(
+                        restorationFailure);
+
+            } else if (executionFailure != null) {
+
+                trace.failure(
+                        executionFailure);
+
+            } else if (executionCompleted) {
+
+                trace.success();
+            }
+
+            /*
+             * Always restore the previous Log4j ThreadContext values.
+             */
+            trace.close();
+
+            /*
+             * A transaction restoration failure overrides a successful
+             * business result or the original execution failure.
+             *
+             * The original failure, when present, has been retained as a
+             * suppressed exception.
+             */
+            if (restorationFailure != null) {
+                throw restorationFailure;
+            }
         }
     }
 
     /**
-     * Prevents an external LLM call from occurring while an OFBiz transaction
-     * is active on the current thread.
+     * Performs one model invocation with transaction enforcement and agent
+     * tracing.
+     *
+     * <p>The helper deliberately contains no provider-specific logic beyond
+     * calling the existing {@link OpenAiCompatibleClient}. It centralizes the
+     * invariant that no model/network call may occur while an OFBiz
+     * transaction is active.</p>
+     *
+     * @param trace execution trace
+     * @param client model transport client
+     * @param sequence one-based LLM call sequence
+     * @param model configured model identifier
+     * @param requestBody complete model request
+     * @return parsed model response
+     * @throws IOException when the transport/model endpoint fails
+     * @throws GenericServiceException when transaction invariants fail
      */
-    private static void rejectActiveTransaction()
+    private static JsonNode callLlm(
+            AgentTrace trace,
+            OpenAiCompatibleClient client,
+            int sequence,
+            String model,
+            JsonNode requestBody)
+            throws IOException, GenericServiceException {
+
+        assertNoActiveTransaction(
+                trace,
+                "before LLM request "
+                + sequence);
+
+        long llmStart =
+                trace.mark();
+
+        trace.operational(
+                AgentTrace.LLM_REQUEST,
+                "sequence",
+                sequence,
+                "model",
+                model);
+
+        trace.payload(
+                AgentTrace.LLM_REQUEST_PAYLOAD,
+                requestBody,
+                "sequence",
+                sequence,
+                "model",
+                model);
+
+        final JsonNode response;
+
+        try {
+            response =
+                    client.createChatCompletion(
+                            requestBody);
+
+        } catch (IOException | RuntimeException e) {
+
+            trace.operational(
+                    AgentTrace.LLM_FAILURE,
+                    "sequence",
+                    sequence,
+                    "model",
+                    model,
+                    "durationMs",
+                    AgentTrace.elapsedMillis(
+                            llmStart),
+                    "failureType",
+                    e.getClass().getName(),
+                    "failureMessage",
+                    e.getMessage());
+
+            throw e;
+        }
+
+        /*
+         * Network/model code must not leave a transaction associated with the
+         * current thread.
+         */
+        assertNoActiveTransaction(
+                trace,
+                "after LLM response "
+                + sequence);
+
+        trace.operational(
+                AgentTrace.LLM_RESPONSE,
+                "sequence",
+                sequence,
+                "model",
+                model,
+                "durationMs",
+                AgentTrace.elapsedMillis(
+                        llmStart));
+
+        trace.payload(
+                AgentTrace.LLM_RESPONSE_PAYLOAD,
+                response,
+                "sequence",
+                sequence,
+                "model",
+                model);
+
+        return response;
+    }
+
+    /**
+     * Suspends an inherited caller transaction.
+     *
+     * <p>No transaction is started by this method. If there is no inherited
+     * transaction, {@code null} is returned.</p>
+     *
+     * <p>Only an ACTIVE parent transaction may be suspended. Other transaction
+     * states fail closed because beginning LLM orchestration while the caller
+     * transaction is preparing, rolling back, marked rollback-only or otherwise
+     * abnormal would make execution semantics ambiguous.</p>
+     *
+     * @param trace current agent trace
+     * @return suspended parent transaction or {@code null}
+     * @throws GenericServiceException if transaction state cannot be safely
+     *         isolated
+     */
+    private static Transaction suspendParentTransaction(
+            AgentTrace trace)
+            throws GenericServiceException {
+
+        try {
+            int status =
+                    TransactionUtil.getStatus();
+
+            if (status
+                    == Status.STATUS_NO_TRANSACTION) {
+
+                return null;
+            }
+
+            String statusString =
+                    TransactionUtil.getStatusString();
+
+            trace.operational(
+                    AgentTrace.TX_PARENT_FOUND,
+                    "status",
+                    statusString);
+
+            if (status
+                    != Status.STATUS_ACTIVE) {
+
+                throw new GenericServiceException(
+                        "Agent execution cannot proceed with inherited "
+                        + "transaction state ["
+                        + statusString
+                        + "]");
+            }
+
+            Transaction parentTransaction =
+                    TransactionUtil.suspend();
+
+            if (parentTransaction == null) {
+
+                throw new GenericServiceException(
+                        "Unable to suspend inherited active transaction "
+                        + "before agent execution");
+            }
+
+            if (TransactionUtil.isTransactionInPlace()) {
+
+                String remainingStatus =
+                        TransactionUtil.getStatusString();
+
+                trace.operational(
+                        AgentTrace.TX_INVARIANT_FAILURE,
+                        "boundary",
+                        "after parent transaction suspension",
+                        "status",
+                        remainingStatus);
+
+                throw new GenericServiceException(
+                        "Transaction remained associated with the thread "
+                        + "after parent suspension; status is ["
+                        + remainingStatus
+                        + "]");
+            }
+
+            trace.operational(
+                    AgentTrace.TX_PARENT_SUSPENDED);
+
+            return parentTransaction;
+
+        } catch (GenericTransactionException e) {
+
+            throw new GenericServiceException(
+                    "Unable to isolate inherited transaction "
+                    + "before agent execution",
+                    e);
+        }
+    }
+
+    /**
+     * Restores the caller transaction after agent execution.
+     *
+     * <p>The agent runtime must not leave any transaction of its own associated
+     * with the execution thread. If an inherited transaction exists, it is
+     * resumed only after verifying that the thread is transaction-free.</p>
+     *
+     * @param parentTransaction transaction suspended at agent entry
+     * @param trace current agent trace
+     * @throws GenericServiceException if the transaction boundary has been
+     *         violated or the parent cannot be restored
+     */
+    private static void resumeParentTransaction(
+            Transaction parentTransaction,
+            AgentTrace trace)
+            throws GenericServiceException {
+
+        /*
+         * No inherited transaction existed.
+         *
+         * We still verify that the agent did not leak a tool/service
+         * transaction onto the thread.
+         */
+        if (parentTransaction == null) {
+
+            assertNoActiveTransaction(
+                    trace,
+                    "at agent completion");
+
+            return;
+        }
+
+        try {
+            if (TransactionUtil.isTransactionInPlace()) {
+
+                String status =
+                        TransactionUtil.getStatusString();
+
+                trace.operational(
+                        AgentTrace.TX_INVARIANT_FAILURE,
+                        "boundary",
+                        "before parent transaction restoration",
+                        "status",
+                        status);
+
+                throw new GenericServiceException(
+                        "Agent execution left a transaction associated "
+                        + "with the thread before parent restoration; "
+                        + "status is ["
+                        + status
+                        + "]");
+            }
+
+            TransactionUtil.resume(
+                    parentTransaction);
+
+            if (!TransactionUtil.isTransactionInPlace()) {
+
+                trace.operational(
+                        AgentTrace.TX_INVARIANT_FAILURE,
+                        "boundary",
+                        "after parent transaction restoration",
+                        "status",
+                        TransactionUtil.getStatusString());
+
+                throw new GenericServiceException(
+                        "Inherited parent transaction was not restored "
+                        + "after agent execution");
+            }
+
+            trace.operational(
+                    AgentTrace.TX_PARENT_RESUMED,
+                    "status",
+                    TransactionUtil.getStatusString());
+
+        } catch (GenericTransactionException e) {
+
+            throw new GenericServiceException(
+                    "Unable to restore inherited transaction "
+                    + "after agent execution",
+                    e);
+        }
+    }
+
+    /**
+     * Enforces the core agent transaction invariant.
+     *
+     * <p>Tracing reports transaction state, but tracing is not enforcement.
+     * This method independently prevents execution from crossing an LLM or
+     * orchestration boundary with an active OFBiz transaction.</p>
+     *
+     * @param trace current agent trace
+     * @param boundary textual execution boundary
+     * @throws GenericServiceException if a transaction is active or its state
+     *         cannot be determined
+     */
+    private static void assertNoActiveTransaction(
+            AgentTrace trace,
+            String boundary)
             throws GenericServiceException {
 
         try {
             if (TransactionUtil.isTransactionInPlace()) {
+
+                String status =
+                        TransactionUtil.getStatusString();
+
+                trace.operational(
+                        AgentTrace.TX_INVARIANT_FAILURE,
+                        "boundary",
+                        boundary,
+                        "status",
+                        status);
+
                 throw new GenericServiceException(
-                        "Agent execution is not permitted inside an active transaction");
+                        "Agent transaction invariant violated at ["
+                        + boundary
+                        + "]; transaction status is ["
+                        + status
+                        + "]");
             }
+
         } catch (GenericTransactionException e) {
+
+            trace.operational(
+                    AgentTrace.TX_INVARIANT_FAILURE,
+                    "boundary",
+                    boundary,
+                    "status",
+                    "unknown",
+                    "failureType",
+                    e.getClass().getName(),
+                    "failureMessage",
+                    e.getMessage());
+
             throw new GenericServiceException(
-                    "Unable to determine transaction state before agent execution",
+                    "Unable to determine transaction state at agent "
+                    + "execution boundary ["
+                    + boundary
+                    + "]",
                     e);
         }
     }
@@ -269,16 +1090,25 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
      */
     private static GenericValue loadAgentDefinition(
             DispatchContext dctx,
-            String agentId) throws GenericEntityException, GenericServiceException {
+            String agentId)
+            throws GenericEntityException, GenericServiceException {
 
-        GenericValue agentDefinition = EntityQuery.use(dctx.getDelegator())
-                .from("AgentDefinition")
-                .where("agentId", agentId)
-                .queryOne();
+        GenericValue agentDefinition =
+                EntityQuery.use(
+                        dctx.getDelegator())
+                        .from(
+                                "AgentDefinition")
+                        .where(
+                                "agentId",
+                                agentId)
+                        .queryOne();
 
         if (agentDefinition == null) {
+
             throw new GenericServiceException(
-                    "Agent definition [" + agentId + "] was not found");
+                    "Agent definition ["
+                    + agentId
+                    + "] was not found");
         }
 
         return agentDefinition;
@@ -289,12 +1119,18 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
      */
     private static List<GenericValue> loadAgentTools(
             DispatchContext dctx,
-            String agentId) throws GenericEntityException {
+            String agentId)
+            throws GenericEntityException {
 
-        return EntityQuery.use(dctx.getDelegator())
-                .from("AgentTool")
-                .where("agentId", agentId)
-                .orderBy("serviceName")
+        return EntityQuery.use(
+                        dctx.getDelegator())
+                .from(
+                        "AgentTool")
+                .where(
+                        "agentId",
+                        agentId)
+                .orderBy(
+                        "serviceName")
                 .queryList();
     }
 
@@ -302,110 +1138,202 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
      * Constructs the first LLM request.
      *
      * <p>The model receives a conceptual zero-argument tool. It never receives
-     * partyId as a tool argument. Customer scope remains under OFBiz control.</p>
+     * partyId as a tool argument. Customer scope remains under OFBiz
+     * control.</p>
      */
     private static ObjectNode buildInitialRequest(
             String model,
             String systemPrompt,
             String toolServiceName) {
 
-        ObjectNode request = OBJECT_MAPPER.createObjectNode();
+        ObjectNode request =
+                OBJECT_MAPPER.createObjectNode();
 
-        request.put("model", model);
-        request.put("temperature", 0.0);
-        request.put("max_tokens", MAX_COMPLETION_TOKENS);
+        request.put(
+                "model",
+                model);
 
-        ArrayNode messages = request.putArray("messages");
+        request.put(
+                "temperature",
+                0.0);
 
-        ObjectNode systemMessage = messages.addObject();
-        systemMessage.put("role", "system");
-        systemMessage.put("content", systemPrompt);
+        request.put(
+                "max_tokens",
+                MAX_COMPLETION_TOKENS);
 
-        ObjectNode userMessage = messages.addObject();
-        userMessage.put("role", "user");
+        ArrayNode messages =
+                request.putArray(
+                        "messages");
+
+        ObjectNode systemMessage =
+                messages.addObject();
+
+        systemMessage.put(
+                "role",
+                "system");
+
+        systemMessage.put(
+                "content",
+                systemPrompt);
+
+        ObjectNode userMessage =
+                messages.addObject();
+
+        userMessage.put(
+                "role",
+                "user");
+
         userMessage.put(
                 "content",
                 "Analyse the overdue outstanding sales invoices "
                 + "for the customer selected in OFBiz. "
                 + "Use the provided tool before answering.");
 
-        ArrayNode tools = request.putArray("tools");
+        ArrayNode tools =
+                request.putArray(
+                        "tools");
 
-        ObjectNode tool = tools.addObject();
-        tool.put("type", "function");
+        ObjectNode tool =
+                tools.addObject();
 
-        ObjectNode function = tool.putObject("function");
-        function.put("name", toolServiceName);
+        tool.put(
+                "type",
+                "function");
+
+        ObjectNode function =
+                tool.putObject(
+                        "function");
+
+        function.put(
+                "name",
+                toolServiceName);
+
         function.put(
                 "description",
                 "Retrieve overdue outstanding sales invoices "
                 + "for the customer selected in OFBiz.");
 
-        ObjectNode parameters = function.putObject("parameters");
-        parameters.put("type", "object");
-        parameters.putObject("properties");
-        parameters.put("additionalProperties", false);
+        ObjectNode parameters =
+                function.putObject(
+                        "parameters");
 
-        ObjectNode toolChoice = request.putObject("tool_choice");
-        toolChoice.put("type", "function");
-        toolChoice.putObject("function")
-                .put("name", toolServiceName);
+        parameters.put(
+                "type",
+                "object");
+
+        parameters.putObject(
+                "properties");
+
+        parameters.put(
+                "additionalProperties",
+                false);
+
+        ObjectNode toolChoice =
+                request.putObject(
+                        "tool_choice");
+
+        toolChoice.put(
+                "type",
+                "function");
+
+        toolChoice.putObject(
+                        "function")
+                .put(
+                        "name",
+                        toolServiceName);
 
         return request;
     }
 
     /**
      * Validates the first model response against the V1 execution protocol.
+     *
+     * <p>The model must request exactly one function, that function must match
+     * the service registered for this agent, and V1 tool arguments must be an
+     * empty JSON object.</p>
      */
     private static ToolCall extractRequiredToolCall(
             JsonNode response,
-            String allowedServiceName) throws GenericServiceException {
+            String allowedServiceName)
+            throws GenericServiceException {
 
-        JsonNode message = extractSingleMessage(response);
+        JsonNode message =
+                extractSingleMessage(
+                        response);
 
-        JsonNode toolCalls = message.get("tool_calls");
+        JsonNode toolCalls =
+                message.get(
+                        "tool_calls");
 
         if (toolCalls == null
                 || !toolCalls.isArray()
                 || toolCalls.size() != 1) {
+
             throw new GenericServiceException(
                     "Agent must return exactly one tool call");
         }
 
-        JsonNode toolCall = toolCalls.get(0);
+        JsonNode toolCall =
+                toolCalls.get(
+                        0);
 
-        String type = textValue(toolCall, "type");
+        String type =
+                textValue(
+                        toolCall,
+                        "type");
 
-        if (!"function".equals(type)) {
+        if (!"function".equals(
+                type)) {
+
             throw new GenericServiceException(
                     "Agent returned a non-function tool call");
         }
 
-        String toolCallId = textValue(toolCall, "id");
+        String toolCallId =
+                textValue(
+                        toolCall,
+                        "id");
 
-        if (toolCallId == null || toolCallId.isBlank()) {
+        if (toolCallId == null
+                || toolCallId.isBlank()) {
+
             throw new GenericServiceException(
                     "Agent tool call does not contain an id");
         }
 
-        JsonNode function = toolCall.get("function");
+        JsonNode function =
+                toolCall.get(
+                        "function");
 
-        if (function == null || !function.isObject()) {
+        if (function == null
+                || !function.isObject()) {
+
             throw new GenericServiceException(
                     "Agent tool call does not contain a function");
         }
 
-        String functionName = textValue(function, "name");
+        String functionName =
+                textValue(
+                        function,
+                        "name");
 
-        if (!allowedServiceName.equals(functionName)) {
+        if (!allowedServiceName.equals(
+                functionName)) {
+
             throw new GenericServiceException(
                     "Agent attempted to invoke undeclared tool ["
-                    + functionName + "]");
+                    + functionName
+                    + "]");
         }
 
-        String arguments = textValue(function, "arguments");
+        String arguments =
+                textValue(
+                        function,
+                        "arguments");
 
-        if (arguments == null || arguments.isBlank()) {
+        if (arguments == null
+                || arguments.isBlank()) {
+
             throw new GenericServiceException(
                     "Agent tool call arguments are missing");
         }
@@ -413,8 +1341,12 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
         final JsonNode parsedArguments;
 
         try {
-            parsedArguments = OBJECT_MAPPER.readTree(arguments);
+            parsedArguments =
+                    OBJECT_MAPPER.readTree(
+                            arguments);
+
         } catch (IOException e) {
+
             throw new GenericServiceException(
                     "Agent tool call arguments are not valid JSON",
                     e);
@@ -422,6 +1354,7 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
 
         if (!parsedArguments.isObject()
                 || parsedArguments.size() != 0) {
+
             throw new GenericServiceException(
                     "Agent tool call must not supply arguments");
         }
@@ -443,17 +1376,33 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
             String partyId,
             Object userLogin) {
 
-        Map<String, Object> toolContext = new HashMap<>();
+        Map<String, Object> toolContext =
+                new HashMap<>();
 
-        toolContext.put("partyId", partyId);
-        toolContext.put("userLogin", userLogin);
+        toolContext.put(
+                "partyId",
+                partyId);
 
-        if (outerContext.get("locale") != null) {
-            toolContext.put("locale", outerContext.get("locale"));
+        toolContext.put(
+                "userLogin",
+                userLogin);
+
+        if (outerContext.get(
+                "locale") != null) {
+
+            toolContext.put(
+                    "locale",
+                    outerContext.get(
+                            "locale"));
         }
 
-        if (outerContext.get("timeZone") != null) {
-            toolContext.put("timeZone", outerContext.get("timeZone"));
+        if (outerContext.get(
+                "timeZone") != null) {
+
+            toolContext.put(
+                    "timeZone",
+                    outerContext.get(
+                            "timeZone"));
         }
 
         return toolContext;
@@ -461,32 +1410,52 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
 
     /**
      * Serializes only the declared business outputs from the OFBiz tool.
+     *
+     * <p>The service's control/status fields are not supplied to the model.
+     * Only business data explicitly selected here crosses the model boundary.</p>
      */
     private static String buildToolResultJson(
-            Map<String, Object> toolResult) throws IOException {
+            Map<String, Object> toolResult)
+            throws IOException {
 
-        ObjectNode businessResult = OBJECT_MAPPER.createObjectNode();
+        ObjectNode businessResult =
+                OBJECT_MAPPER.createObjectNode();
 
-        Object partyName = toolResult.get("partyName");
+        Object partyName =
+                toolResult.get(
+                        "partyName");
 
         if (partyName == null) {
-            businessResult.putNull("partyName");
+
+            businessResult.putNull(
+                    "partyName");
+
         } else {
-            businessResult.put("partyName", partyName.toString());
+
+            businessResult.put(
+                    "partyName",
+                    partyName.toString());
         }
 
         Object invoicePaymentInfoList =
-                toolResult.get("invoicePaymentInfoList");
+                toolResult.get(
+                        "invoicePaymentInfoList");
 
         if (invoicePaymentInfoList == null) {
-            businessResult.putArray("invoicePaymentInfoList");
+
+            businessResult.putArray(
+                    "invoicePaymentInfoList");
+
         } else {
+
             businessResult.set(
                     "invoicePaymentInfoList",
-                    OBJECT_MAPPER.valueToTree(invoicePaymentInfoList));
+                    OBJECT_MAPPER.valueToTree(
+                            invoicePaymentInfoList));
         }
 
-        return OBJECT_MAPPER.writeValueAsString(businessResult);
+        return OBJECT_MAPPER.writeValueAsString(
+                businessResult);
     }
 
     /**
@@ -501,68 +1470,137 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
             ToolCall toolCall,
             String toolResultJson) {
 
-        ObjectNode request = OBJECT_MAPPER.createObjectNode();
+        ObjectNode request =
+                OBJECT_MAPPER.createObjectNode();
 
-        request.put("model", model);
-        request.put("temperature", 0.0);
-        request.put("max_tokens", MAX_COMPLETION_TOKENS);
+        request.put(
+                "model",
+                model);
 
-        ArrayNode messages = request.putArray("messages");
+        request.put(
+                "temperature",
+                0.0);
 
-        ObjectNode systemMessage = messages.addObject();
-        systemMessage.put("role", "system");
-        systemMessage.put("content", systemPrompt);
+        request.put(
+                "max_tokens",
+                MAX_COMPLETION_TOKENS);
 
-        ObjectNode userMessage = messages.addObject();
-        userMessage.put("role", "user");
+        ArrayNode messages =
+                request.putArray(
+                        "messages");
+
+        ObjectNode systemMessage =
+                messages.addObject();
+
+        systemMessage.put(
+                "role",
+                "system");
+
+        systemMessage.put(
+                "content",
+                systemPrompt);
+
+        ObjectNode userMessage =
+                messages.addObject();
+
+        userMessage.put(
+                "role",
+                "user");
+
         userMessage.put(
                 "content",
                 "Analyse the overdue outstanding sales invoices "
                 + "for the customer selected in OFBiz. "
                 + "Use the provided tool before answering.");
 
-        ObjectNode assistantMessage = messages.addObject();
-        assistantMessage.put("role", "assistant");
-        assistantMessage.putNull("content");
+        ObjectNode assistantMessage =
+                messages.addObject();
 
-        ArrayNode toolCalls = assistantMessage.putArray("tool_calls");
+        assistantMessage.put(
+                "role",
+                "assistant");
 
-        ObjectNode call = toolCalls.addObject();
-        call.put("id", toolCall.id());
-        call.put("type", "function");
+        assistantMessage.putNull(
+                "content");
 
-        ObjectNode function = call.putObject("function");
-        function.put("name", toolCall.functionName());
-        function.put("arguments", toolCall.arguments());
+        ArrayNode toolCalls =
+                assistantMessage.putArray(
+                        "tool_calls");
 
-        ObjectNode toolMessage = messages.addObject();
-        toolMessage.put("role", "tool");
-        toolMessage.put("tool_call_id", toolCall.id());
-        toolMessage.put("content", toolResultJson);
+        ObjectNode call =
+                toolCalls.addObject();
+
+        call.put(
+                "id",
+                toolCall.id());
+
+        call.put(
+                "type",
+                "function");
+
+        ObjectNode function =
+                call.putObject(
+                        "function");
+
+        function.put(
+                "name",
+                toolCall.functionName());
+
+        function.put(
+                "arguments",
+                toolCall.arguments());
+
+        ObjectNode toolMessage =
+                messages.addObject();
+
+        toolMessage.put(
+                "role",
+                "tool");
+
+        toolMessage.put(
+                "tool_call_id",
+                toolCall.id());
+
+        toolMessage.put(
+                "content",
+                toolResultJson);
 
         return request;
     }
 
     /**
-     * Extracts the final textual answer.
+     * Extracts and validates the final textual answer.
+     *
+     * <p>A second tool call is prohibited in V1.</p>
      */
     private static String extractFinalSummary(
-            JsonNode response) throws GenericServiceException {
+            JsonNode response)
+            throws GenericServiceException {
 
-        JsonNode message = extractSingleMessage(response);
+        JsonNode message =
+                extractSingleMessage(
+                        response);
 
-        JsonNode toolCalls = message.get("tool_calls");
+        JsonNode toolCalls =
+                message.get(
+                        "tool_calls");
 
         if (toolCalls != null
                 && toolCalls.isArray()
                 && toolCalls.size() > 0) {
+
             throw new GenericServiceException(
                     "Agent attempted an additional tool call");
         }
 
-        String content = textValue(message, "content");
+        String content =
+                textValue(
+                        message,
+                        "content");
 
-        if (content == null || content.isBlank()) {
+        if (content == null
+                || content.isBlank()) {
+
             throw new GenericServiceException(
                     "Agent returned an empty final response");
         }
@@ -574,25 +1612,35 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
      * Extracts exactly one assistant message from a Chat Completions response.
      */
     private static JsonNode extractSingleMessage(
-            JsonNode response) throws GenericServiceException {
+            JsonNode response)
+            throws GenericServiceException {
 
-        if (response == null || !response.isObject()) {
+        if (response == null
+                || !response.isObject()) {
+
             throw new GenericServiceException(
                     "LLM response is not a JSON object");
         }
 
-        JsonNode choices = response.get("choices");
+        JsonNode choices =
+                response.get(
+                        "choices");
 
         if (choices == null
                 || !choices.isArray()
                 || choices.size() != 1) {
+
             throw new GenericServiceException(
                     "LLM response must contain exactly one choice");
         }
 
-        JsonNode message = choices.get(0).get("message");
+        JsonNode message =
+                choices.get(0).get(
+                        "message");
 
-        if (message == null || !message.isObject()) {
+        if (message == null
+                || !message.isObject()) {
+
             throw new GenericServiceException(
                     "LLM response does not contain an assistant message");
         }
@@ -611,9 +1659,14 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
             return null;
         }
 
-        JsonNode value = node.get(fieldName);
+        JsonNode value =
+                node.get(
+                        fieldName);
 
-        if (value == null || value.isNull() || !value.isTextual()) {
+        if (value == null
+                || value.isNull()
+                || !value.isTextual()) {
+
             return null;
         }
 

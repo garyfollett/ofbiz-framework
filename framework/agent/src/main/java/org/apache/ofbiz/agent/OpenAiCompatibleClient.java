@@ -56,25 +56,43 @@ public final class OpenAiCompatibleClient {
             long requestTimeoutMillis) {
 
         if (baseUrl == null || baseUrl.isBlank()) {
-            throw new IllegalArgumentException("baseUrl must not be empty");
+            throw new IllegalArgumentException(
+                    "baseUrl must not be empty");
         }
+
         if (connectTimeoutMillis <= 0) {
-            throw new IllegalArgumentException("connectTimeoutMillis must be greater than zero");
+            throw new IllegalArgumentException(
+                    "connectTimeoutMillis must be greater than zero");
         }
+
         if (requestTimeoutMillis <= 0) {
-            throw new IllegalArgumentException("requestTimeoutMillis must be greater than zero");
+            throw new IllegalArgumentException(
+                    "requestTimeoutMillis must be greater than zero");
         }
 
-        String normalizedBaseUrl = baseUrl.endsWith("/")
-                ? baseUrl.substring(0, baseUrl.length() - 1)
-                : baseUrl;
+        String normalizedBaseUrl =
+                baseUrl.endsWith("/")
+                        ? baseUrl.substring(
+                                0,
+                                baseUrl.length() - 1)
+                        : baseUrl;
 
-        this.chatCompletionsUri = URI.create(normalizedBaseUrl + "/chat/completions");
-        this.requestTimeout = Duration.ofMillis(requestTimeoutMillis);
+        this.chatCompletionsUri =
+                URI.create(
+                        normalizedBaseUrl
+                        + "/chat/completions");
 
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofMillis(connectTimeoutMillis))
-                .build();
+        this.requestTimeout =
+                Duration.ofMillis(
+                        requestTimeoutMillis);
+
+        this.httpClient =
+                HttpClient.newBuilder()
+                        .version(HttpClient.Version.HTTP_1_1)
+                        .connectTimeout(
+                                Duration.ofMillis(
+                                        connectTimeoutMillis))
+                        .build();
     }
 
     /**
@@ -85,44 +103,77 @@ public final class OpenAiCompatibleClient {
      * @throws IOException if the request cannot be sent, the endpoint returns
      *         a non-success status, or the response is not valid JSON
      */
-    public JsonNode createChatCompletion(JsonNode requestBody) throws IOException {
-        if (requestBody == null || !requestBody.isObject()) {
-            throw new IllegalArgumentException("requestBody must be a JSON object");
+    public JsonNode createChatCompletion(
+            JsonNode requestBody)
+            throws IOException {
+
+        if (requestBody == null
+                || !requestBody.isObject()) {
+            throw new IllegalArgumentException(
+                    "requestBody must be a JSON object");
         }
 
-        String requestJson = OBJECT_MAPPER.writeValueAsString(requestBody);
+        String requestJson =
+                OBJECT_MAPPER.writeValueAsString(
+                        requestBody);
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(chatCompletionsUri)
-                .timeout(requestTimeout)
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(requestJson))
-                .build();
+        HttpRequest request =
+                HttpRequest.newBuilder()
+                        .uri(chatCompletionsUri)
+                        .timeout(requestTimeout)
+                        .header(
+                                "Content-Type",
+                                "application/json")
+                        .POST(
+                                HttpRequest.BodyPublishers.ofString(
+                                        requestJson))
+                        .build();
 
         final HttpResponse<String> response;
 
         try {
-            response = httpClient.send(
-                    request,
-                    HttpResponse.BodyHandlers.ofString());
+            response =
+                    httpClient.send(
+                            request,
+                            HttpResponse.BodyHandlers.ofString());
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while calling LLM endpoint", e);
-        }
 
-        int statusCode = response.statusCode();
-
-        if (statusCode < 200 || statusCode >= 300) {
             throw new IOException(
-                    "LLM endpoint returned HTTP status " + statusCode);
+                    "Interrupted while calling LLM endpoint",
+                    e);
         }
 
-        String responseBody = response.body();
+        int statusCode =
+                response.statusCode();
 
-        if (responseBody == null || responseBody.isBlank()) {
-            throw new IOException("LLM endpoint returned an empty response");
+        String responseBody =
+                response.body();
+
+        if (statusCode < 200
+                || statusCode >= 300) {
+
+            String errorBody =
+                    responseBody == null
+                            || responseBody.isBlank()
+                                    ? "<empty response body>"
+                                    : responseBody;
+
+            throw new IOException(
+                    "LLM endpoint returned HTTP status "
+                    + statusCode
+                    + ": "
+                    + errorBody);
         }
 
-        return OBJECT_MAPPER.readTree(responseBody);
+        if (responseBody == null
+                || responseBody.isBlank()) {
+            throw new IOException(
+                    "LLM endpoint returned an empty response");
+        }
+
+        return OBJECT_MAPPER.readTree(
+                responseBody);
     }
 }
