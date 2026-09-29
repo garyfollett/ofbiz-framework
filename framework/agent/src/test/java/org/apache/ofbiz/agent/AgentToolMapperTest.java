@@ -128,13 +128,19 @@ public class AgentToolMapperTest {
          * 5. dueDate becomes deterministic ISO date-time;
          * 6. monetary scale is represented inside JSON strings.
          */
+        String expectedJson =
+                "{\"partyName\":\"Euro Customer\","
+                + "\"invoicePaymentInfoList\":[{"
+                + "\"invoiceId\":\"demo11000\","
+                + "\"amount\":\"20.00\","
+                + "\"paidAmount\":\"0.00\","
+                + "\"outstandingAmount\":\"20.00\","
+                + "\"dueDate\":\"2006-04-25T23:59:59.000+10:00\"}]}";
+
         assertEquals(
-                """
-                {"partyName":"Euro Customer","invoicePaymentInfoList":[{"invoiceId":"demo11000","amount":"20.00","paidAmount":"0.00","outstandingAmount":"20.00","dueDate":"2006-04-25T23:59:59.000+10:00"}]}\
-                """,
+                expectedJson,
                 json);
     }
-
     /**
      * Proves the actual JSON node types produced at the boundary.
      *
@@ -273,9 +279,8 @@ public class AgentToolMapperTest {
                 "partyName");
 
         GenericServiceException exception =
-                assertThrows(
-                        GenericServiceException.class,
-                        () -> AgentToolMapper.map(
+                assertThrows(GenericServiceException.class, () ->
+                        AgentToolMapper.map(
                                 contract,
                                 rawResult,
                                 SYDNEY_TIME_ZONE));
@@ -315,9 +320,8 @@ public class AgentToolMapperTest {
                 "outstandingAmount");
 
         GenericServiceException exception =
-                assertThrows(
-                        GenericServiceException.class,
-                        () -> AgentToolMapper.map(
+                assertThrows(GenericServiceException.class, () ->
+                        AgentToolMapper.map(
                                 contract,
                                 rawResult,
                                 SYDNEY_TIME_ZONE));
@@ -361,9 +365,8 @@ public class AgentToolMapperTest {
                 20.0d);
 
         GenericServiceException exception =
-                assertThrows(
-                        GenericServiceException.class,
-                        () -> AgentToolMapper.map(
+                assertThrows(GenericServiceException.class, () ->
+                        AgentToolMapper.map(
                                 contract,
                                 rawResult,
                                 SYDNEY_TIME_ZONE));
@@ -391,9 +394,8 @@ public class AgentToolMapperTest {
                 loadProductionContract();
 
         GenericServiceException exception =
-                assertThrows(
-                        GenericServiceException.class,
-                        () -> AgentToolMapper.map(
+                assertThrows(GenericServiceException.class, () ->
+                        AgentToolMapper.map(
                                 contract,
                                 originalStyleServiceResult(),
                                 null));
@@ -469,9 +471,8 @@ public class AgentToolMapperTest {
                         invoiceRecord()));
 
         GenericServiceException exception =
-                assertThrows(
-                        GenericServiceException.class,
-                        () -> AgentToolMapper.map(
+                assertThrows(GenericServiceException.class, () ->
+                        AgentToolMapper.map(
                                 contract,
                                 rawResult,
                                 SYDNEY_TIME_ZONE));

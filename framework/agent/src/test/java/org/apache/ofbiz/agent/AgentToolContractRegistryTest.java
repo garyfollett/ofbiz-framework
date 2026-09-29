@@ -139,9 +139,8 @@ public class AgentToolContractRegistryTest {
                         new AgentToolContractLoader());
 
         GenericServiceException exception =
-                assertThrows(
-                        GenericServiceException.class,
-                        () -> registry.getRequired(
+                assertThrows(GenericServiceException.class, () ->
+                        registry.getRequired(
                                 "serviceThatIsNotConfiguredForAgents"));
 
         assertTrue(
@@ -304,9 +303,8 @@ public class AgentToolContractRegistryTest {
              * The new snapshot replaces the old snapshot; it is not merged
              * with it.
              */
-            assertThrows(
-                    GenericServiceException.class,
-                    () -> registry.getRequired(
+            assertThrows(GenericServiceException.class, () ->
+                    registry.getRequired(
                             "serviceVersionOne"));
         }
     }

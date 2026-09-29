@@ -135,9 +135,8 @@ public class AgentValueCodecTest {
     @Test
     public void testCurrencyAmountRejectsValueThatRequiresRounding() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "currency-amount",
                         new BigDecimal("20.001"),
                         null));
@@ -200,9 +199,8 @@ public class AgentValueCodecTest {
     @Test
     public void testFixedPointRejectsExcessPrecision() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "fixed-point",
                         new BigDecimal("123.4567891"),
                         null));
@@ -242,16 +240,14 @@ public class AgentValueCodecTest {
     @Test
     public void testDateRejectsLocalizedStringInput() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "date",
                         "28/09/2026",
                         null));
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "date",
                         "09/28/2026",
                         null));
@@ -339,9 +335,8 @@ public class AgentValueCodecTest {
                         Instant.parse(
                                 "2026-09-28T00:29:00.000Z"));
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "date-time",
                         value,
                         null));
@@ -359,9 +354,8 @@ public class AgentValueCodecTest {
                         Instant.parse(
                                 "2026-09-28T00:29:00.123456Z"));
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "date-time",
                         value,
                         UTC_TIME_ZONE));
@@ -514,9 +508,8 @@ public class AgentValueCodecTest {
     @Test
     public void testFloatingPointRejectsNaN() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "floating-point",
                         Double.NaN,
                         null));
@@ -528,9 +521,8 @@ public class AgentValueCodecTest {
     @Test
     public void testFloatingPointRejectsPositiveInfinity() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "floating-point",
                         Double.POSITIVE_INFINITY,
                         null));
@@ -542,9 +534,8 @@ public class AgentValueCodecTest {
     @Test
     public void testFloatingPointRejectsNegativeInfinity() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "floating-point",
                         Double.NEGATIVE_INFINITY,
                         null));
@@ -573,9 +564,8 @@ public class AgentValueCodecTest {
     @Test
     public void testNullDoesNotBypassUnsupportedTypeValidation() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "unknown-type",
                         null,
                         null));
@@ -587,9 +577,8 @@ public class AgentValueCodecTest {
     @Test
     public void testObjectTypeFailsClosed() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "object",
                         new Object(),
                         null));
@@ -601,9 +590,8 @@ public class AgentValueCodecTest {
     @Test
     public void testByteArrayTypeFailsClosed() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "byte-array",
                         new byte[] {1, 2, 3},
                         null));
@@ -615,9 +603,8 @@ public class AgentValueCodecTest {
     @Test
     public void testBlobTypeFailsClosed() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "blob",
                         null,
                         null));
@@ -630,9 +617,8 @@ public class AgentValueCodecTest {
     @Test
     public void testUnknownSemanticTypeFailsClosed() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "made-up-type",
                         "value",
                         null));
@@ -645,9 +631,8 @@ public class AgentValueCodecTest {
     @Test
     public void testWrongJavaTypeFailsClosed() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "currency-amount",
                         Double.valueOf(
                                 20.0d),
@@ -660,9 +645,8 @@ public class AgentValueCodecTest {
     @Test
     public void testNumericRejectsIntegerJavaType() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "numeric",
                         Integer.valueOf(
                                 1000),
@@ -675,9 +659,8 @@ public class AgentValueCodecTest {
     @Test
     public void testIntegerRejectsLongJavaType() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         "integer",
                         Long.valueOf(
                                 42L),
@@ -709,9 +692,8 @@ public class AgentValueCodecTest {
     @Test
     public void testEmptySemanticTypeFailsClosed() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         " ",
                         "value",
                         null));
@@ -723,9 +705,8 @@ public class AgentValueCodecTest {
     @Test
     public void testNullSemanticTypeFailsClosed() {
 
-        assertThrows(
-                GenericServiceException.class,
-                () -> AgentValueCodec.encode(
+        assertThrows(GenericServiceException.class, () ->
+                AgentValueCodec.encode(
                         null,
                         "value",
                         null));
