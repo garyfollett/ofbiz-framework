@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TimeZone;
 
 import javax.transaction.Status;
 import javax.transaction.Transaction;
@@ -523,16 +524,40 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
             }
 
             /*
-             * Serialize only the explicitly permitted business outputs.
+             * Resolve the immutable semantic contract for the governed OFBiz
+             * service and map only the fields declared by that contract.
              *
-             * This representation is the exact business data that will be
-             * exposed to the model.
+             * Generic serialization of OFBiz business values is deliberately
+             * prohibited at this model boundary.
              */
-            String toolResultJson =
-                    buildToolResultJson(
-                            toolResult);
+            AgentToolContract toolContract =
+                    AgentToolContractRegistry.getDefault()
+                            .getRequired(
+                                    toolServiceName);
 
-            trace.payload(
+            /*
+             * Timezone is authoritative OFBiz execution context.
+             *
+             * There is deliberately no fallback to TimeZone.getDefault().
+             * A missing timezone remains null so AgentValueCodec can fail
+             * closed when a date-time field requires an explicit timezone.
+             */
+            TimeZone effectiveTimeZone =
+                    getAuthoritativeTimeZone(
+                            context);
+
+            String toolResultJson =
+                    AgentToolMapper.mapToJson(
+                            toolContract,
+                            toolResult,
+                            effectiveTimeZone);
+
+            /*
+             * toolResultJson is already the governed model-bound
+             * representation. Trace its exact lexical form rather than
+             * reparsing and reserializing it.
+             */
+            trace.payloadExact(
                     AgentTrace.TOOL_RESULT_FOR_MODEL,
                     toolResultJson,
                     "service",
@@ -1409,53 +1434,37 @@ public final class AgentServiceEngine extends GenericAsyncEngine {
     }
 
     /**
-     * Serializes only the declared business outputs from the OFBiz tool.
+     * Returns the authoritative timezone supplied by the outer OFBiz service
+     * context.
      *
-     * <p>The service's control/status fields are not supplied to the model.
-     * Only business data explicitly selected here crosses the model boundary.</p>
+     * <p>The semantic boundary must not silently use the JVM default timezone.
+     * A missing timezone is therefore returned as {@code null}. If the tool
+     * result contains a configured date-time field, {@link AgentValueCodec}
+     * will fail closed rather than inventing timezone semantics.</p>
+     *
+     * @param context authoritative outer OFBiz service context
+     * @return authoritative timezone, or {@code null} when absent
+     * @throws GenericServiceException if a non-TimeZone value was supplied
      */
-    private static String buildToolResultJson(
-            Map<String, Object> toolResult)
-            throws IOException {
+    private static TimeZone getAuthoritativeTimeZone(
+            Map<String, Object> context)
+            throws GenericServiceException {
 
-        ObjectNode businessResult =
-                OBJECT_MAPPER.createObjectNode();
+        Object value =
+                context.get(
+                        "timeZone");
 
-        Object partyName =
-                toolResult.get(
-                        "partyName");
-
-        if (partyName == null) {
-
-            businessResult.putNull(
-                    "partyName");
-
-        } else {
-
-            businessResult.put(
-                    "partyName",
-                    partyName.toString());
+        if (value == null) {
+            return null;
         }
 
-        Object invoicePaymentInfoList =
-                toolResult.get(
-                        "invoicePaymentInfoList");
-
-        if (invoicePaymentInfoList == null) {
-
-            businessResult.putArray(
-                    "invoicePaymentInfoList");
-
-        } else {
-
-            businessResult.set(
-                    "invoicePaymentInfoList",
-                    OBJECT_MAPPER.valueToTree(
-                            invoicePaymentInfoList));
+        if (!(value instanceof TimeZone)) {
+            throw new GenericServiceException(
+                    "Agent service context timeZone must be a "
+                    + "java.util.TimeZone");
         }
 
-        return OBJECT_MAPPER.writeValueAsString(
-                businessResult);
+        return (TimeZone) value;
     }
 
     /**

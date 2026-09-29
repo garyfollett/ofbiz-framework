@@ -31,4 +31,6 @@ under the License.
 
     <service-resource type="model" loader="main" location="servicedef/services.xml"/>
 
+    <test-suite loader="main" location="testdef/agenttests.xml"/>
+
 </ofbiz-component>

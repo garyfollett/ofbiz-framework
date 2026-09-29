@@ -427,6 +427,10 @@ public final class AgentTrace implements AutoCloseable {
      * In metadata mode only size and SHA-256 are emitted. In full mode the
      * sanitized payload is emitted.</p>
      *
+     * <p>This general payload path is intended for structured or potentially
+     * sensitive data. JSON values are parsed when appropriate so known
+     * sensitive fields can be redacted before being logged.</p>
+     *
      * @param eventName stable payload event name
      * @param payload payload to trace
      * @param attributes alternating key/value pairs
@@ -502,6 +506,105 @@ public final class AgentTrace implements AutoCloseable {
         } catch (RuntimeException e) {
             safeTracingFailure(
                     "Unable to record agent payload trace",
+                    e);
+        }
+    }
+
+    /**
+     * Emits metadata and optionally content for an exact model-bound string.
+     *
+     * <p>This path is deliberately different from {@link #payload(String,
+     * Object, Object...)}. The supplied character sequence is already a
+     * governed representation and must not be parsed, normalized, redacted,
+     * reserialized or otherwise semantically transformed before its size and
+     * digest are calculated.</p>
+     *
+     * <p>The UTF-8 byte count and SHA-256 digest are calculated directly from
+     * the exact supplied text. In full payload mode the same text is then made
+     * safe for single-line log presentation. That presentation escaping occurs
+     * only after the exact byte count and digest have been calculated.</p>
+     *
+     * <p>This method must be used only for payloads whose contents have already
+     * passed an appropriate governed boundary. It must not be used as a way to
+     * bypass redaction for arbitrary request bodies, credentials, secrets or
+     * other untrusted data.</p>
+     *
+     * @param eventName stable payload event name
+     * @param payload exact model-bound character sequence
+     * @param attributes alternating key/value pairs
+     */
+    public void payloadExact(
+            String eventName,
+            CharSequence payload,
+            Object... attributes) {
+
+        if (traceLevel
+                != TraceLevel.DIAGNOSTIC) {
+            return;
+        }
+
+        if (payloadMode
+                == PayloadMode.OFF) {
+            return;
+        }
+
+        try {
+            String exactPayload =
+                    payload == null
+                            ? "null"
+                            : payload.toString();
+
+            byte[] payloadBytes =
+                    exactPayload.getBytes(
+                            StandardCharsets.UTF_8);
+
+            String payloadSha256 =
+                    sha256(
+                            payloadBytes);
+
+            if (payloadMode
+                    == PayloadMode.METADATA) {
+
+                Object[] combined =
+                        appendAttributes(
+                                attributes,
+                                "payloadCharacters",
+                                exactPayload.length(),
+                                "payloadBytes",
+                                payloadBytes.length,
+                                "payloadSha256",
+                                payloadSha256);
+
+                safeLog(
+                        eventName,
+                        combined);
+
+                return;
+            }
+
+            String logPayload =
+                    sanitizeLogLine(
+                            exactPayload);
+
+            Object[] combined =
+                    appendAttributes(
+                            attributes,
+                            "payloadCharacters",
+                            exactPayload.length(),
+                            "payloadBytes",
+                            payloadBytes.length,
+                            "payloadSha256",
+                            payloadSha256,
+                            "payload",
+                            logPayload);
+
+            safeLog(
+                    eventName,
+                    combined);
+
+        } catch (RuntimeException e) {
+            safeTracingFailure(
+                    "Unable to record exact agent payload trace",
                     e);
         }
     }

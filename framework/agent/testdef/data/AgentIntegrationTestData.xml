@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements. See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership. The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License. You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied. See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+<!--
+    Deterministic integration-test data for the OFBiz Agent component.
+
+    Purpose
+    =======
+
+    This fixture supports AgentServiceEngineIntegrationTest.
+
+    It deliberately creates a customer and one unpaid, overdue sales invoice
+    whose business values exercise the outbound semantic boundary:
+
+        OFBiz BigDecimal amount     -> canonical "20.00"
+        OFBiz zero paid amount      -> canonical "0.00"
+        OFBiz outstanding amount    -> canonical "20.00"
+        OFBiz Timestamp due date    -> canonical ISO-8601 date-time
+        OFBiz service metadata      -> excluded by AgentToolContract
+
+    The test identifiers are deliberately distinct from the standard OFBiz
+    demo identifiers such as EuroCustomer and demo11000. The integration-test
+    task requires the normal OFBiz data set to have been loaded first, so
+    reusing demo primary keys would make the test fixture dependent on, or
+    collide with, pre-existing demo data.
+
+    No PaymentApplication is created for AGENT_INT_1000. Therefore
+    InvoiceWorker.getInvoiceApplied() returns zero for this invoice.
+
+    No InvoiceTerm is created. Consequently getInvoicePaymentInfoList derives
+    its payment due date from:
+
+        UtilDateTime.getDayEnd(invoice.invoiceDate)
+
+    With the test invoiceDate below, the expected business result is one
+    outstanding invoice for 20.00.
+
+    The enclosing OFBiz integration-test infrastructure is responsible for
+    rolling back test-suite mutations after execution.
+-->
+
+<entity-engine-xml>
+
+    <!--
+        CUSTOMER
+
+        getPartyNameForDate looks up PartyGroup for this partyId and returns
+        PartyGroup.groupName as fullName.
+
+        The integration test therefore expects:
+
+            partyName = "Euro Customer"
+    -->
+
+    <Party
+            partyId="AgentIntCustomer"
+            partyTypeId="PARTY_GROUP"
+            statusId="PARTY_ENABLED"/>
+
+    <PartyGroup
+            partyId="AgentIntCustomer"
+            groupName="Euro Customer"/>
+
+    <!--
+        SALES INVOICE
+
+        This invoice is:
+
+        * a SALES_INVOICE;
+        * owned by the integration-test customer;
+        * not CANCELLED or PAID;
+        * old enough to be overdue for any current integration-test run;
+        * unpaid;
+        * worth exactly 20.00.
+
+        getInvoicePaymentInfoListByDueDateOffset selects it because:
+
+            invoiceTypeId = SALES_INVOICE
+            partyId       = AgentIntCustomer
+            statusId      = INVOICE_APPROVED
+
+        and because its calculated due date is before the current day end.
+    -->
+
+    <Invoice
+            invoiceId="AGENT_INT_1000"
+            invoiceTypeId="SALES_INVOICE"
+            partyIdFrom="Company"
+            partyId="AgentIntCustomer"
+            statusId="INVOICE_APPROVED"
+            invoiceDate="2006-04-25 12:46:27.122"
+            dueDate="2006-05-25 12:46:27.122"
+            description="Agent semantic boundary integration test invoice"
+            currencyUomId="EUR"/>
+
+    <!--
+        A single invoice item gives InvoiceWorker.getInvoiceTotal() an exact
+        value of 20.0.
+
+        The semantic boundary must convert the resulting BigDecimal monetary
+        value to the canonical currency-amount representation "20.00".
+    -->
+
+    <InvoiceItem
+            invoiceId="AGENT_INT_1000"
+            invoiceItemSeqId="00001"
+            invoiceItemTypeId="INV_SPROD_ITEM"
+            uomId="EUR"
+            taxableFlag="Y"
+            amount="20.0"
+            description="Agent semantic boundary integration test item"/>
+
+    <!--
+        Keep normal OFBiz invoice-status history consistent with the current
+        INVOICE_APPROVED state.
+
+        These records are not directly consumed by AgentToolMapper; they make
+        the fixture a valid, conventional OFBiz invoice rather than a synthetic
+        partial record tailored only to the mapper.
+    -->
+
+    <InvoiceStatus
+            statusId="INVOICE_IN_PROCESS"
+            invoiceId="AGENT_INT_1000"
+            statusDate="2006-04-25 12:46:27.122"/>
+
+    <InvoiceStatus
+            statusId="INVOICE_APPROVED"
+            invoiceId="AGENT_INT_1000"
+            statusDate="2006-04-25 12:46:27.122"/>
+
+</entity-engine-xml>
+
